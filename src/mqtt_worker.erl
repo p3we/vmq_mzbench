@@ -9,6 +9,7 @@
     disconnect/2,
     publish/5,
     publish/6,
+    subscribe/3,
     subscribe/4,
     unsubscribe/3,
     random_client_id/3,
@@ -206,15 +207,25 @@ publish(#state{mqtt_fsm = SessionPid} = State, _Meta, Topic, Payload, QoS, Retai
             {nil, State}
     end.
 
-subscribe(#state{mqtt_fsm = SessionPid} = State, _Meta, Topic, Qos) ->
-    case vmq_topic:validate_topic(subscribe, list_to_binary(Topic)) of
-        {ok, TTopic} ->
-            gen_emqtt:subscribe(SessionPid, TTopic, Qos),
-            {nil, State};
-        {error, Reason} ->
-            error_logger:warning_msg("Can't validate topic conf ~p due to ~p~n", [Topic, Reason]),
-            {nil, State}
-    end.
+
+subscribe(#state{mqtt_fsm = SessionPid} = State, _Meta, [T|_] = Topics) when is_tuple(T) ->
+    ValidTopics = lists:filtermap(
+        fun({Topic, Qos}) ->
+            case vmq_topic:validate_topic(subscribe, list_to_binary(Topic)) of
+                {ok, ValidTopic} ->
+                    {true, {ValidTopic, Qos}};
+                {error, Reason} ->
+                    error_logger:warning_msg("Can't validate topic conf ~p due to ~p~n", [Topic, Reason]),
+                    false
+            end
+        end,
+        Topics
+    ),
+    gen_emqtt:subscribe(SessionPid, ValidTopics),
+    {nil, State}.
+
+subscribe(State, Meta, Topic, Qos) ->
+    subscribe(State, Meta, [{Topic, Qos}]).
 
 unsubscribe(#state{mqtt_fsm = SessionPid} = State, _Meta, Topics) ->
     gen_emqtt:unsubscribe(SessionPid, Topics),
