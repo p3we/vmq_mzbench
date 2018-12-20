@@ -19,6 +19,7 @@
     idle/2,
     forward/4,
     publish_to_one/6,
+    publish_to_one/7,
     client/2,
     worker_id/2,
     fixed_client_id/4,
@@ -238,7 +239,10 @@ publish_to_self(#state{client = ClientId} = State, _Meta, TopicPrefix, Payload, 
     publish(State, _Meta, TopicPrefix ++ ClientId, Payload, Qos).
 
 publish_to_one(State, Meta, TopicPrefix, ClientId, Payload, Qos) ->
-    publish(State, Meta, TopicPrefix ++ ClientId, Payload, Qos).
+    publish_to_one(State, Meta, TopicPrefix, ClientId, Payload, Qos, false).
+
+publish_to_one(State, Meta, TopicPrefix, ClientId, Payload, Qos, Retain) ->
+    publish(State, Meta, TopicPrefix ++ ClientId, Payload, Qos, Retain).
 
 idle(#state{mqtt_fsm = SessionPid} = State, _Meta) ->
     gen_fsm:send_all_state_event(SessionPid, {idle}),
