@@ -6,6 +6,7 @@
 % MZBench statement commands
 -export([
     connect/3,
+    connect/4,
     disconnect/2,
     publish/5,
     publish/6,
@@ -42,6 +43,7 @@
     on_connect/1,
     on_connect_error/2,
     on_disconnect/1,
+    on_close/1,
     on_subscribe/2,
     on_unsubscribe/2,
     on_publish/3]).
@@ -49,7 +51,7 @@
 -include_lib("public_key/include/public_key.hrl").
 
 -record(state, {mqtt_fsm, client}).
--record(mqtt, {action}).
+-record(mqtt, {is_connected, action, worker_pid, worker_state}).
 
 -behaviour(gen_emqtt).
 
@@ -117,9 +119,15 @@ metrics() ->
 %% ------------------------------------------------
 %% Gen_MQTT Callbacks (partly un-used)
 %% ------------------------------------------------
-on_connect(State) ->
+on_connect(#mqtt{worker_state=WorkerState, worker_pid=Pid} = State) ->
     mzb_metrics:notify({"mqtt.connection.current_total", counter}, 1),
-    {ok, State}.
+    case WorkerState of
+        await_connected ->
+            gen_fsm:reply(Pid, ok),
+            {ok, State#mqtt{is_connected=true, worker_state=idle, worker_pid=nil}};
+        _ ->
+            {ok, State#mqtt{is_connected=true}}
+    end.
 
 on_connect_error(_Reason, State) ->
     mzb_metrics:notify({"mqtt.connection.connect.errors", counter}, 1),
@@ -129,18 +137,40 @@ on_disconnect(State) ->
     mzb_metrics:notify({"mqtt.connection.current_total", counter}, -1),
     {ok, State}.
 
-on_subscribe(Topics, State) ->
+on_close(#mqtt{worker_state=WorkerState, worker_pid=Pid} = State) ->
+    mzb_metrics:notify({"mqtt.connection.current_total", counter}, -1),
+    case WorkerState of
+        await_disconnected ->
+            gen_fsm:reply(Pid, ok),
+            {stop, normal, State#mqtt{is_connected=false, worker_state=idle, worker_pid=nil}};
+        _ ->
+            {stop, normal, State#mqtt{is_connected=false}}
+    end.
+
+on_subscribe(Topics, #mqtt{worker_state=WorkerState, worker_pid=Pid} = State) ->
     case Topics of
         {error, _T, _QoSTable} ->
             mzb_metrics:notify({"mqtt.consumer.suback.errors", counter}, 1);
     _ ->
     mzb_metrics:notify({"mqtt.consumer.current_total", counter}, 1)
     end,
-    {ok, State}.
+    case WorkerState of
+        await_subscribed ->
+            gen_fsm:reply(Pid, ok),
+            {ok, State#mqtt{worker_state=idle, worker_pid=nil}};
+        _ ->
+            {ok, State}
+    end.
 
-on_unsubscribe(_Topics, State) ->
+on_unsubscribe(_Topics, #mqtt{worker_state=WorkerState, worker_pid=Pid} = State) ->
     mzb_metrics:notify({"mqtt.consumer.current_total", counter}, -1),
-    {ok, State}.
+    case WorkerState of
+        await_unsubscribed ->
+            gen_fsm:reply(Pid, ok),
+            {ok, State#mqtt{worker_state=idle, worker_pid=nil}};
+        _ ->
+            {ok, State}
+    end.
 
 on_publish(Topic, Payload, #mqtt{action=Action} = State) ->
     mzb_metrics:notify({"mqtt.message.consumed.total", counter}, 1),
@@ -162,8 +192,25 @@ on_publish(Topic, Payload, #mqtt{action=Action} = State) ->
             {ok, State}
     end.
 
-handle_call(_Req, _From, State) ->
-    {reply, ok, State}.
+handle_call(Req, From, #mqtt{is_connected=IsConnected} = State) ->
+    case Req of
+        {connect} when IsConnected == false->
+            {noreply, State#mqtt{worker_state=await_connected, worker_pid=From}};
+        {disconnect} ->
+            gen_emqtt:disconnect(self()),
+            {noreply, State#mqtt{worker_state=await_disconnected, worker_pid=From}};
+        {subscribe, Topics} ->
+            gen_emqtt:subscribe(self(), Topics),
+            {noreply, State#mqtt{worker_state=await_subscribed, worker_pid=From}};
+        {unsubscribe, Topics} ->
+            gen_emqtt:unsubscribe(self(), Topics),
+            {noreply, State#mqtt{worker_state=await_unsubscribed, worker_pid=From}};
+        {publish, Topic, Payload, QoS, Retain} ->
+            gen_emqtt:publish(self(), Topic, Payload, QoS, Retain),
+            {reply, ok, State};
+        _ ->
+            {reply, ok, State}
+    end.
 
 handle_cast(Req, State) ->
     {noreply, State#mqtt{action=Req}}.
@@ -172,7 +219,6 @@ handle_info(_Req, State) ->
     {noreply, State}.
 
 terminate(_Reason, _State) ->
-    mzb_metrics:notify({"mqtt.connection.current_total", counter}, -1),
     ok.
 
 code_change(_OldVsn, State, _Extra) ->
@@ -183,14 +229,18 @@ code_change(_OldVsn, State, _Extra) ->
 %% MZBench API (Statement Functions)
 %% ------------------------------------------------
 
-connect(State, _Meta, ConnectOpts) ->
+connect(State, _Meta, ConnectOpts, Timeout) ->
     ClientId = proplists:get_value(client, ConnectOpts),
-    Args = #mqtt{action={idle}},
+    Args = #mqtt{is_connected=false, action={idle}, worker_state=nil, worker_pid=nil},
     {ok, SessionPid} = gen_emqtt:start_link(?MODULE, Args, [{info_fun, {fun stats/2, maps:new()}}|ConnectOpts]),
+    gen_fsm:sync_send_all_state_event(SessionPid, {connect}, Timeout),
     {nil, State#state{mqtt_fsm=SessionPid, client=ClientId}}.
 
+connect(State, Meta, ConnectOpts) ->
+    connect(State, Meta, ConnectOpts, infinity).
+
 disconnect(#state{mqtt_fsm=SessionPid} = State, _Meta) ->
-    gen_emqtt:disconnect(SessionPid),
+    gen_fsm:sync_send_all_state_event(SessionPid, {disconnect}, infinity),
     {nil, State}.
 
 publish(State, _Meta, Topic, Payload, QoS) ->
@@ -200,14 +250,13 @@ publish(#state{mqtt_fsm = SessionPid} = State, _Meta, Topic, Payload, QoS, Retai
     case vmq_topic:validate_topic(publish, list_to_binary(Topic)) of
         {ok, TTopic} ->
             Payload1 = term_to_binary({os:timestamp(), Payload}),
-            gen_emqtt:publish(SessionPid, TTopic, Payload1, QoS, Retain),
+            gen_fsm:sync_send_all_state_event(SessionPid, {publish, TTopic, Payload1, QoS, Retain}, infinity),
             mzb_metrics:notify({"mqtt.message.published.total", counter}, 1),
             {nil, State};
         {error, Reason} ->
             error_logger:warning_msg("Can't validate topic ~p due to ~p~n", [Topic, Reason]),
             {nil, State}
     end.
-
 
 subscribe(#state{mqtt_fsm = SessionPid} = State, _Meta, [T|_] = Topics) when is_tuple(T) ->
     ValidTopics = lists:filtermap(
@@ -216,24 +265,27 @@ subscribe(#state{mqtt_fsm = SessionPid} = State, _Meta, [T|_] = Topics) when is_
                 {ok, ValidTopic} ->
                     {true, {ValidTopic, Qos}};
                 {error, Reason} ->
-                    error_logger:warning_msg("Can't validate topic conf ~p due to ~p~n", [Topic, Reason]),
+                    error_logger:error_msg("Can't validate topic conf ~p due to ~p~n", [Topic, Reason]),
                     false
             end
         end,
         Topics
     ),
-    gen_emqtt:subscribe(SessionPid, ValidTopics),
+    case length(ValidTopics) of
+        0 -> false;
+        _ -> gen_fsm:sync_send_all_state_event(SessionPid, {subscribe, ValidTopics}, infinity)
+    end,
     {nil, State}.
 
 subscribe(State, Meta, Topic, Qos) ->
     subscribe(State, Meta, [{Topic, Qos}]).
 
-unsubscribe(#state{mqtt_fsm = SessionPid} = State, _Meta, Topics) ->
-    gen_emqtt:unsubscribe(SessionPid, Topics),
-    {nil, State}.
-
 subscribe_to_self(#state{client = ClientId} = State, _Meta, TopicPrefix, Qos) ->
     subscribe(State, _Meta, TopicPrefix ++ ClientId, Qos).
+
+unsubscribe(#state{mqtt_fsm = SessionPid} = State, _Meta, Topics) ->
+    gen_fsm:sync_send_all_state_event(SessionPid, {unsubscribe, Topics}, infinity),
+    {nil, State}.
 
 publish_to_self(#state{client = ClientId} = State, _Meta, TopicPrefix, Payload, Qos) ->
     publish(State, _Meta, TopicPrefix ++ ClientId, Payload, Qos).
