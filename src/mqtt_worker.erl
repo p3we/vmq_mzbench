@@ -294,9 +294,12 @@ subscribe(State, Meta, Topic, Qos) ->
 subscribe_to_self(#state{client = ClientId} = State, _Meta, TopicPrefix, Qos) ->
     subscribe(State, _Meta, TopicPrefix ++ ClientId, Qos).
 
-unsubscribe(#state{mqtt_fsm = SessionPid} = State, _Meta, Topics) ->
-    gen_fsm:sync_send_all_state_event(SessionPid, {unsubscribe, Topics}, infinity),
-    {nil, State}.
+unsubscribe(#state{mqtt_fsm = SessionPid} = State, _Meta, [T|_] = Topics) when is_list(T) ->
+    BinTopics = lists:map(fun erlang:list_to_binary/1, Topics),
+    gen_fsm:sync_send_all_state_event(SessionPid, {unsubscribe, BinTopics}, infinity),
+    {nil, State};
+unsubscribe(State, Meta, Topic) ->
+    unsubscribe(State, Meta, [Topic]).
 
 publish_to_self(#state{client = ClientId} = State, _Meta, TopicPrefix, Payload, Qos) ->
     publish(State, _Meta, TopicPrefix ++ ClientId, Payload, Qos).
