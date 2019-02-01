@@ -130,7 +130,7 @@ metrics() ->
 %% ------------------------------------------------
 %% Gen_MQTT Callbacks (partly un-used)
 %% ------------------------------------------------
-on_connect(#mqtt{worker_state=WorkerState, worker_pid=Pid} = State) ->
+on_connect(#mqtt{is_connected=false, worker_state=WorkerState, worker_pid=Pid} = State) ->
     mzb_metrics:notify({"mqtt.connection.current_total", counter}, 1),
     case WorkerState of
         await_connected ->
@@ -138,17 +138,21 @@ on_connect(#mqtt{worker_state=WorkerState, worker_pid=Pid} = State) ->
             {ok, State#mqtt{is_connected=true, worker_state=idle, worker_pid=nil}};
         _ ->
             {ok, State#mqtt{is_connected=true}}
-    end.
+    end;
+on_connect(State) ->
+    {ok, State}.
 
 on_connect_error(_Reason, State) ->
     mzb_metrics:notify({"mqtt.connection.connect.errors", counter}, 1),
     {ok, State}.
 
-on_disconnect(State) ->
+on_disconnect(#mqtt{is_connected=true} = State) ->
     mzb_metrics:notify({"mqtt.connection.current_total", counter}, -1),
+    {ok, State#mqtt{is_connected=false}};
+on_disconnect(State) ->
     {ok, State}.
 
-on_close(#mqtt{worker_state=WorkerState, worker_pid=Pid} = State) ->
+on_close(#mqtt{is_connected=true, worker_state=WorkerState, worker_pid=Pid} = State) ->
     mzb_metrics:notify({"mqtt.connection.current_total", counter}, -1),
     case WorkerState of
         await_disconnected ->
@@ -156,7 +160,9 @@ on_close(#mqtt{worker_state=WorkerState, worker_pid=Pid} = State) ->
             {stop, normal, State#mqtt{is_connected=false, worker_state=idle, worker_pid=nil}};
         _ ->
             {stop, normal, State#mqtt{is_connected=false}}
-    end.
+    end;
+on_close(State) ->
+    {ok, State}.
 
 on_subscribe(Topics, #mqtt{worker_state=WorkerState, worker_pid=Pid} = State) ->
     case Topics of
@@ -207,7 +213,7 @@ handle_call(Req, From, #mqtt{is_connected=IsConnected} = State) ->
     case Req of
         {connect} when IsConnected == false->
             {noreply, State#mqtt{worker_state=await_connected, worker_pid=From}};
-        {disconnect} ->
+        {disconnect} when IsConnected == true ->
             gen_emqtt:disconnect(self()),
             {noreply, State#mqtt{worker_state=await_disconnected, worker_pid=From}};
         {subscribe, Topics} ->
